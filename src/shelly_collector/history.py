@@ -18,8 +18,12 @@ def blocks_from_records(payload):
         if not isinstance(block, dict):
             raise ValueError("Bloc historique invalide")
         ts, period, records = block.get("ts"), block.get("period"), block.get("records")
-        if not all(type(n) is int for n in (ts, period, records)) or period <= 0 or records <= 0:
+        if not all(type(n) is int for n in (ts, period, records)) or period <= 0 or records < 0:
             raise ValueError("Métadonnées de bloc incorrectes : {}".format(block))
+        if records == 0:
+            # GetRecords peut signaler une plage sans mesure (notamment
+            # la minute en cours). Ce n'est pas un historique à télécharger.
+            continue
         valid.append({"ts": ts, "period": period, "records": records})
     return valid
 

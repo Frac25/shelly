@@ -23,6 +23,21 @@ class TestHistory(unittest.TestCase):
         with self.assertRaises(ValueError):
             blocks_from_records({"data_blocks":[{"ts":0,"period":0,"records":1}]})
 
+    def test_empty_record_marker_is_ignored(self):
+        page = {"data_blocks": [
+            {"ts": 1795000000, "period": 60, "records": 3},
+            {"ts": 1795102320, "period": 60, "records": 0},
+        ]}
+        blocks = blocks_from_records(page)
+        self.assertEqual(blocks, [{"ts": 1795000000, "period": 60, "records": 3}])
+        self.assertEqual(blocks_from_records({"data_blocks": [page["data_blocks"][1]]}), [])
+
+    def test_negative_record_count_rejected(self):
+        with self.assertRaises(ValueError):
+            blocks_from_records({"data_blocks": [
+                {"ts": 1795000000, "period": 60, "records": -1}
+            ]})
+
     def test_pagination_without_next_marker(self):
         with tempfile.TemporaryDirectory() as folder:
             db = connect(Path(folder)/"a.db")
