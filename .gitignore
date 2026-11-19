@@ -1,0 +1,9 @@
+
+/data/
+__pycache__/
+*.py[cod]
+.DS_Store
+*.zip
+/diagnostic.json
+.env
+.venv/
