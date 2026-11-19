@@ -1,0 +1,7 @@
+{
+  "devices": [
+    {"alias": "em_gen3", "host": "192.168.1.60", "description": "Shelly EM Gen3 - compteur 2 canaux"},
+    {"alias": "chaudiere", "host": "192.168.1.58", "description": "Shelly 1 Gen4 - relais chaudiere"},
+    {"alias": "em_gen4", "host": "192.168.1.41", "description": "Shelly EM Gen4 - compteur 2 canaux"}
+  ]
+}
