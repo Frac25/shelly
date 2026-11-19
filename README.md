@@ -1,63 +1,64 @@
-# Shelly Data Collector — Étape 1 : diagnostic Mac
+# Shelly Data Collector — Étape 2 (Mac)
 
-Projet de diagnostic **en lecture seule** pour 3 appareils Shelly du réseau RED.
-Aucun service n'est installé, aucune tâche quotidienne n'est programmée, aucun relais n'est modifié.
+**Projet sans dépendance externe, compatible Python 3.8.5.** Il ne modifie jamais les appareils, ne pilote jamais les relais, et n'installe **aucune** tâche quotidienne. La base SQLite de cette étape est **locale sur le Mac** : le stockage central sur le VPS arrivera à l'étape 3.
 
-## Compatibilité
-- Mac Intel sous macOS 10.15.8 (Catalina)
-- Fonctionne au stade diagnostic avec Python **3.8.5** déjà présent, car uniquement bibliothèque standard
-- Objectif à terme : Python récent, stockage SQLite sur VPS Debian 12, synchronisation SSH
+## Installation dans le projet existant
 
-## Lancer dans VS Code (terminal LOCAL du Mac)
+1. Faire une copie du dossier `~/Documents/shelly` actuel, ou un commit Git.
+2. Décompresser l'archive, copier ses fichiers dans `~/Documents/shelly` (conserver le dossier `data/` déjà présent).
+3. Lancer dans le terminal **local** du Mac :
 
 ```bash
 cd ~/Documents/shelly
-python3 --version
-make list
 make test
-make audit
+make list
+make history DEVICE=em_gen3 DAYS=1
+make stats
+make export
 ```
 
-Le dernier appel interroge chaque appareil une seule fois pour `/shelly`,
-une fois pour `/rpc/Shelly.GetStatus`, puis la **première page**
-des intervalles historiques via `EM1Data.GetRecords` pour les compteurs.
-Il n'effectue **pas** encore de téléchargement complet des mesures.
+**Le premier essai ne lit qu'un compteur sur les dernières 24 heures.** Quand c'est validé :
 
-Résultat : `data/diagnostic.json`. Le fichier contient le modèle, les composants,
-les plages d'historique visibles et les erreurs éventuelles, mais pas la réponse
-complète de statut ni les informations réseau Wi-Fi sensibles.
+```bash
+make collect DAYS=7
+make stats
+make export
+```
 
-## Préparer le dossier
+Les quatre historiques (Gen3 et Gen4, canaux 0 et 1) seront alors importés; le relais chaudière aura une photographie de son état courant. Les données sont conservées dans `data/local.sqlite3`; les exports CSV sont dans `data/exports/`.
 
-Télécharge et décompresse cette archive dans un dossier temporaire. Copie son
-contenu dans `~/Documents/shelly`. **Ne remplace pas** des fichiers existants sans
-vérifier : ce dossier peut déjà contenir tes propres modifications.
+## Autres commandes
 
-## Fichiers
-- `config/devices.json` : tes 3 IP/alias initiaux. Éditable.
-- `src/shelly_collector/http.py` : GET strictement limité aux 3 endpoints de lecture.
-- `src/shelly_collector/diagnostic.py` : résumé des métadonnées.
-- `src/shelly_collector/cli.py` : interface de commande.
-- `tests` : tests sans réseau.
-- `data` : fichiers locaux ignorés par Git.
+```bash
+make audit
+make snapshot                 # une photo par jour civil et appareil
+make history DAYS=3           # les 3 derniers jours, pas de photo
+make history SINCE=2026-11-12 UNTIL=2026-11-20 # UTC, borne de fin exclue
+make backfill                 # toutes les plages annoncées par GetRecords
+make backfill DEVICE=em_gen4  # uniquement le Gen4
+make stats
+make export
+```
 
-## Limites volontaires de l'étape 1
-- Pas de collecte automatisée ni de synchronisation vers le VPS.
-- Pas d'export CSV ni de base SQLite : étapes suivantes après validation.
-- Une page de `GetRecords` ne prouve pas la totalité de l'historique :
-  l'import final gérera la pagination et les horodatages.
-- Une tâche quotidienne peut récupérer un historique à la minute *si* celui-ci
-  est conservé par les compteurs. Pour le relais de chaudière, les basculements
-  intermédiaires non enregistrés ne sont pas reconstituables.
+`make backfill` peut demander de nombreuses requêtes (une heure par fenêtre) et prendra plus de temps. Il n'efface rien et peut être relancé. Les blocs dont l'horodatage est incohérent (antérieur à 2020 ou futur) sont enregistrés en métadonnées dans `suspect_blocks` et exclus du CSV principal. Leur contenu sur l'appareil n'est jamais effacé. Dans cet état, l'enregistrement des données de ces blocs est **différé** jusqu'à validation de l'horloge et de leur correspondance réelle.
 
-## Sécurité
-N'ouvre pas les ports des Shelly sur Internet. Aucune connexion entrante n'est
-nécessaire depuis le VPS. Les identifiants d'appareils et les mots de passe ne sont
-pas nécessaires pour les 3 appareils testés (`auth_en: false`), mais active une
-protection réseau domestique adaptée, car une API locale non authentifiée peut
-être pilotée par des appareils déjà présents sur ton LAN.
+### Déduplication
 
-## Documentation
+- Identifiant stable Shelly `id` (non IP ou alias), canal, timestamp UNIX UTC, période : clé primaire dans `history`.
+- Une mesure corrigée par le Shelly est mise à jour; une mesure identique ne change pas.
+- Les snapshots `Shelly.GetStatus` sont limités à un **par jour civil selon la zone locale du Mac**, et par appareil. Une journée où le Mac est éteint ne crée pas de fausse photo.
+- Les CSV sont régénérés à partir de la base, pas accumulés fichier après fichier.
+- En cas d'échec réseau, la prochaine commande relance la même période sans doublons; pour les trous historiques, utiliser `make backfill` ou `SINCE/UNTIL`.
+
+### Contraintes / vigilance
+
+- Les mesures qui n'ont jamais été enregistrées dans l'appareil (notamment les basculements passés du relais) ne sont pas récupérables par cette API.
+- Si les appareils ont des mesures plus anciennes que 7 jours, utiliser `make backfill`; celui-ci vérifie les blocs `EM1Data.GetRecords`, la page n°1 du diagnostic ne suffit pas.
+- L'import sur Mac ne prouve pas encore que toutes les réponses de firmware réel respectent les exemples de la documentation officielle. Si une erreur de format survient, interrompre et transmettre **le message d'erreur**, sans clés API ni mots de passe. On adaptera le décodeur.
+- L'export des états peut contenir des noms de réseau, IP et autres métadonnées : garder `data/` privé, ne pas publier sous Git.
+- `data/local.sqlite3`, ses éventuels fichiers WAL et les exports doivent être sauvegardés avant toute réinstallation.
+
+## Documents officiels
+
 - https://shelly-api-docs.shelly.cloud/gen2/ComponentsAndServices/EM1Data/
 - https://shelly-api-docs.shelly.cloud/gen2/Devices/Gen4/ShellyEMG4/
-- https://www.shelly.com/blogs/documentation/shelly-em-gen3

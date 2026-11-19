@@ -1,15 +1,21 @@
-"""CLI étape 1. Aucune programmation et aucune action sur les relais."""
+"""Interface de commande du collecteur Shelly. Aucune tâche planifiée ici."""
 import argparse
 import json
-import pathlib
+from pathlib import Path
 import sys
+from datetime import datetime, timedelta, timezone
 
 from .diagnostic import current_utc, diagnostic_device
-from .http import validate_local_host
+from .exporters import export_all
+from .history import collect_channel, iso_from_ts
+from .http import ShellyConnectionError, get_json, validate_local_host
+from .storage import connect, register_device, save_snapshot, stats
 
-ROOT = pathlib.Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = ROOT / "config" / "devices.json"
-DEFAULT_OUTPUT = ROOT / "data" / "diagnostic.json"
+DEFAULT_DIAGNOSTIC = ROOT / "data" / "diagnostic.json"
+DEFAULT_DB = ROOT / "data" / "local.sqlite3"
+DEFAULT_EXPORTS = ROOT / "data" / "exports"
 
 
 def load_devices(path):
@@ -29,31 +35,38 @@ def load_devices(path):
     return devices
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description="Diagnostic Shelly en lecture seule (Mac)")
-    parser.add_argument("command", choices=("list", "audit"), help="list=configuration; audit=HTTP local et métadonnées historiques")
-    parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Chemin vers devices.json")
-    parser.add_argument("--output", default=str(DEFAULT_OUTPUT), help="Fichier JSON de diagnostic")
-    args = parser.parse_args(argv)
-    try:
-        devices = load_devices(args.config)
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
-        print("Erreur configuration : {}".format(exc), file=sys.stderr)
-        return 2
+def date_to_utc(date_text):
+    return int(datetime.strptime(date_text, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp())
 
-    if args.command == "list":
-        for item in devices:
-            print("{:<16} {}  {}".format(item["alias"], item["host"], item.get("description", "")))
-        return 0
 
+def select_window(args):
+    now = int(datetime.now(timezone.utc).timestamp())
+    if args.all_available:
+        since = date_to_utc("2020-01-01")
+    elif args.since:
+        since = date_to_utc(args.since)
+    else:
+        if args.days <= 0 or args.days > 365:
+            raise ValueError("--days doit être compris entre 1 et 365")
+        since = now - int(args.days * 86400)
+    # --until est une date EXCLUSIVE en UTC, pratique pour un intervalle précis.
+    until = date_to_utc(args.until) - 1 if args.until else now
+    if since > until:
+        raise ValueError("Plage vide : vérifier --since et --until (exclusif)")
+    if until > now + 86400:
+        raise ValueError("La fin de plage ne doit pas dépasser demain")
+    return since, until
+
+
+def do_audit(devices, output):
     report = {"diagnostic_utc": current_utc(), "mode": "read_only", "devices": []}
-    failed = 0
+    failures = 0
     for item in devices:
         print("\n--- {} ({}) ---".format(item["alias"], item["host"]))
         result = diagnostic_device(item)
         report["devices"].append(result)
         identity = result["identity"] or {}
-        print("Modèle : {} | Gen {} | Firmware {}".format(identity.get("model", "non identifié"), identity.get("gen", "?"), identity.get("ver", "?")))
+        print("Modèle : {} | Gen {} | Firmware {}".format(identity.get("model", "?"), identity.get("gen", "?"), identity.get("ver", "?")))
         print("Composants : {}".format(", ".join(result["components"]) or "non disponibles"))
         for label, summary in sorted(result["history"].items()):
             if "error" in summary:
@@ -62,19 +75,102 @@ def main(argv=None):
                 print("Historique {} : {} bloc(s) visibles, période(s) {} s, du {} au {} (UTC)".format(
                     label, summary["data_blocks_on_page"], summary["periods_seconds_on_page"],
                     summary["first_timestamp_utc_on_page"], summary["last_timestamp_utc_on_page"]))
-        for error in result["errors"]:
-            print("ATTENTION : {}".format(error))
+        for err in result["errors"]:
+            print("ATTENTION : {}".format(err))
         if result["errors"] or any("error" in entry for entry in result["history"].values()):
-            failed += 1
-
-    target = pathlib.Path(args.output)
+            failures += 1
+    target = Path(output)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print("\nDiagnostic enregistré dans {}".format(target))
-    if failed:
-        print("Attention : {} appareil(s) avec une ou plusieurs erreurs".format(failed), file=sys.stderr)
-        return 1
-    return 0
+    return 1 if failures else 0
+
+
+def run_collection(db, devices, args):
+    do_history = args.command in ("history", "collect")
+    do_snapshot = args.command in ("snapshot", "collect")
+    if do_history:
+        since, until = select_window(args)
+        print("Historique : {} à {} UTC".format(iso_from_ts(since), iso_from_ts(until)))
+    failures = 0
+    for device in devices:
+        print("\n--- {} ({}) ---".format(device["alias"], device["host"]))
+        try:
+            identity = get_json(device["host"], "/shelly")
+            device_id = register_device(db, identity, device["alias"], current_utc())
+            status = get_json(device["host"], "/rpc/Shelly.GetStatus")
+            if do_snapshot:
+                # Date macOS locale (Europe/Paris si la zone système est réglée ainsi).
+                local_day = datetime.now().astimezone().date().isoformat()
+                added = save_snapshot(db, device_id, local_day, current_utc(), status)
+                print("État du jour : {}".format("enregistré" if added else "déjà présent, aucun doublon"))
+            if do_history:
+                channels = sorted(int(k.split(":")[1]) for k in status
+                    if k.startswith("em1data:") and k.split(":")[1].isdigit())
+                if not channels:
+                    print("Aucun composant EM1Data : pas d'historique minute par cette API")
+                for channel in channels:
+                    try:
+                        changed, windows, suspect = collect_channel(db, device["host"], device_id,
+                            channel, since, until, all_available=args.all_available)
+                        print("Canal {} : {} ligne(s) nouvelles/corrigées, {} appels GetData, {} bloc(s) suspects".format(
+                            channel, changed, windows, suspect))
+                    except (ShellyConnectionError, ValueError, OSError) as exc:
+                        print("ERREUR {} canal {} : {}".format(device["alias"], channel, exc), file=sys.stderr)
+                        failures += 1
+        except (ShellyConnectionError, ValueError, OSError) as exc:
+            print("ERREUR {} : {}".format(device["alias"], exc), file=sys.stderr)
+            failures += 1
+    return 1 if failures else 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Shelly : diagnostic + historique SQLite local")
+    parser.add_argument("command", choices=("list", "audit", "snapshot", "history", "collect", "export", "stats"))
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG))
+    parser.add_argument("--output", default=str(DEFAULT_DIAGNOSTIC), help="Fichier audit")
+    parser.add_argument("--db", default=str(DEFAULT_DB))
+    parser.add_argument("--exports", default=str(DEFAULT_EXPORTS))
+    parser.add_argument("--device", help="Limiter à un alias du fichier de configuration")
+    parser.add_argument("--days", type=int, default=7, help="Plage glissante en jours UTC (défaut : 7)")
+    parser.add_argument("--since", help="Date de début UTC incluse : YYYY-MM-DD")
+    parser.add_argument("--until", help="Date de fin UTC EXCLUE : YYYY-MM-DD")
+    parser.add_argument("--all-available", action="store_true", help="Lire les blocs GetRecords disponibles et ignorer ceux d'horloge suspecte")
+    args = parser.parse_args(argv)
+    try:
+        if args.command in ("export", "stats"):
+            db = connect(args.db)
+            try:
+                if args.command == "stats":
+                    for name, value in stats(db).items():
+                        print("{} : {}".format(name, value))
+                else:
+                    result = export_all(db, args.exports)
+                    for name, count in result.items():
+                        print("{} : {} lignes".format(name, count))
+                    print("Fichiers CSV dans {}".format(args.exports))
+            finally:
+                db.close()
+            return 0
+        devices = load_devices(args.config)
+        if args.device:
+            devices = [d for d in devices if d["alias"] == args.device]
+            if not devices:
+                raise ValueError("Alias inconnu : {}".format(args.device))
+        if args.command == "list":
+            for d in devices:
+                print("{:<16} {}  {}".format(d["alias"], d["host"], d.get("description", "")))
+            return 0
+        if args.command == "audit":
+            return do_audit(devices, args.output)
+        db = connect(args.db)
+        try:
+            return run_collection(db, devices, args)
+        finally:
+            db.close()
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print("Erreur : {}".format(exc), file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

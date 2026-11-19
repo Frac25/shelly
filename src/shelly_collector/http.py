@@ -23,15 +23,15 @@ def validate_local_host(host):
 def get_json(host, path, params=None, timeout=6):
     """Requête GET sur un Shelly; n'invoque aucune méthode de modification."""
     host = validate_local_host(host)
-    if path not in ("/shelly", "/rpc/Shelly.GetStatus", "/rpc/EM1Data.GetRecords"):
+    if path not in ("/shelly", "/rpc/Shelly.GetStatus", "/rpc/EM1Data.GetRecords", "/rpc/EM1Data.GetData"):
         raise ValueError("Endpoint non autorisé : {}".format(path))
     url = "http://{}{}".format(host, path)
     if params:
         url += "?" + urlencode(params)
-    request = Request(url, headers={"User-Agent": "ShellyCollector-Diagnostic/0.1"})
+    request = Request(url, headers={"User-Agent": "ShellyCollector-ReadOnly/0.2"})
     try:
         with urlopen(request, timeout=timeout) as response:
-            # Diagnostic: limiter la réponse à 2 Mo; le téléchargement des séries sera ajouté plus tard.
+            # Limiter chaque réponse à 2 Mo; les séries sont récupérées par fenêtres bornées.
             raw = response.read(2 * 1024 * 1024 + 1)
         if len(raw) > 2 * 1024 * 1024:
             raise ShellyConnectionError("Réponse trop volumineuse")
