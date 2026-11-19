@@ -1,4 +1,4 @@
-"""SQLite local : tampon durable (le VPS sera la base centrale à l'étape 3)."""
+"""SQLite local : base de référence sur Mac; exportable ultérieurement."""
 import json
 import sqlite3
 from pathlib import Path
@@ -27,6 +27,12 @@ CREATE TABLE IF NOT EXISTS snapshots (
     status_json TEXT NOT NULL,
     PRIMARY KEY (device_id, local_day),
     FOREIGN KEY (device_id) REFERENCES devices(device_id)
+);
+CREATE TABLE IF NOT EXISTS daily_runs (
+    local_day TEXT PRIMARY KEY,
+    started_at_utc TEXT NOT NULL,
+    finished_at_utc TEXT,
+    outcome TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS suspect_blocks (
     device_id TEXT NOT NULL,
@@ -100,10 +106,38 @@ def save_suspect(db, device_id, channel, block, reason):
             (device_id, channel, block["ts"], block["period"], block["records"], reason))
 
 
+def last_channel_timestamp(db, device_id, channel):
+    return db.execute("""SELECT MAX(timestamp_utc) FROM history
+                       WHERE device_id=? AND channel=?""",
+                      (device_id, channel)).fetchone()[0]
+
+
+def claim_daily(db, day, started_at):
+    """Un seul déclenchement planifié par jour (même si le processus s'arrête)."""
+    with db:
+        row = db.execute("""INSERT OR IGNORE INTO daily_runs
+              (local_day, started_at_utc, outcome)
+              VALUES (?, ?, 'running')""", (day, started_at))
+        return row.rowcount == 1
+
+
+def finish_daily(db, day, finished_at, ok):
+    with db:
+        db.execute("""UPDATE daily_runs SET finished_at_utc=?, outcome=?
+                      WHERE local_day=?""",
+                   (finished_at, 'success' if ok else 'failed', day))
+
+
+def daily_outcome(db, day):
+    row = db.execute("SELECT outcome FROM daily_runs WHERE local_day=?", (day,)).fetchone()
+    return row[0] if row else None
+
+
 def stats(db):
     return {
         "devices": db.execute("SELECT COUNT(*) FROM devices").fetchone()[0],
         "history_records": db.execute("SELECT COUNT(*) FROM history").fetchone()[0],
         "daily_snapshots": db.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0],
         "suspect_blocks": db.execute("SELECT COUNT(*) FROM suspect_blocks").fetchone()[0],
+        "daily_runs": db.execute("SELECT COUNT(*) FROM daily_runs").fetchone()[0],
     }
