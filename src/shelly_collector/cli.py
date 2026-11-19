@@ -1,5 +1,6 @@
 """Interface de commande du collecteur Shelly. Aucune tâche planifiée ici."""
 import argparse
+import fcntl
 import json
 from pathlib import Path
 import sys
@@ -7,10 +8,11 @@ from datetime import datetime, timedelta, timezone
 
 from .diagnostic import current_utc, diagnostic_device
 from .exporters import export_all
-from .history import collect_channel, iso_from_ts
+from .history import MIN_VALID_TS, collect_channel, iso_from_ts
 from .http import ShellyConnectionError, get_json, validate_local_host
 from .storage import (connect, register_device, save_snapshot, stats,
-                      last_channel_timestamp, claim_daily, finish_daily, daily_outcome)
+                      last_channel_timestamp, claim_daily, finish_daily, daily_outcome,
+                      daily_device_outcome, mark_daily_device)
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = ROOT / "config" / "devices.json"
@@ -87,7 +89,7 @@ def do_audit(devices, output):
     return 1 if failures else 0
 
 
-def run_collection(db, devices, args):
+def run_collection(db, devices, args, daily_day=None):
     do_history = args.command in ("history", "collect", "daily")
     do_snapshot = args.command in ("snapshot", "collect", "daily")
     if do_history:
@@ -95,13 +97,17 @@ def run_collection(db, devices, args):
         print("Historique : {} à {} UTC".format(iso_from_ts(since), iso_from_ts(until)))
     failures = 0
     for device in devices:
-        print("\n--- {} ({}) ---".format(device["alias"], device["host"]))
+        alias = device["alias"]
+        if daily_day and daily_device_outcome(db, daily_day, alias) == "success":
+            print("\n--- {} : déjà traité avec succès aujourd'hui, ignoré ---".format(alias))
+            continue
+        print("\n--- {} ({}) ---".format(alias, device["host"]))
+        device_failed = False
         try:
             identity = get_json(device["host"], "/shelly")
-            device_id = register_device(db, identity, device["alias"], current_utc())
+            device_id = register_device(db, identity, alias, current_utc())
             status = get_json(device["host"], "/rpc/Shelly.GetStatus")
             if do_snapshot:
-                # Date macOS locale (Europe/Paris si la zone système est réglée ainsi).
                 local_day = datetime.now().astimezone().date().isoformat()
                 added = save_snapshot(db, device_id, local_day, current_utc(), status)
                 print("État du jour : {}".format("enregistré" if added else "déjà présent, aucun doublon"))
@@ -113,28 +119,86 @@ def run_collection(db, devices, args):
                 for channel in channels:
                     try:
                         channel_since = since
+                        all_available = args.all_available
                         if args.command == "daily":
                             latest = last_channel_timestamp(db, device_id, channel)
-                            if latest is not None:
-                                # 2h de recouvrement corrigent les dernières données
-                                # sans relire systématiquement sept jours.
-                                channel_since = min(until, max(until - 30 * 86400, latest - 7200))
-                                if latest < until - 30 * 86400:
-                                    print("ATTENTION canal {} : historique > 30 jours ; "
-                                          "rattrapage partiel uniquement".format(channel))
-                            print("Canal {} : reprise depuis {}".format(channel,
-                                iso_from_ts(channel_since)))
+                            # Après plusieurs jours d'arrêt, reprendre au dernier point
+                            # connu. L'API GetRecords limite aux blocs encore conservés.
+                            channel_since = max(MIN_VALID_TS, latest - 7200) if latest is not None else MIN_VALID_TS
+                            all_available = True
+                            print("Canal {} : rattrapage depuis {} (dans la limite des blocs conservés)".format(
+                                channel, iso_from_ts(channel_since)))
                         changed, windows, suspect = collect_channel(db, device["host"], device_id,
-                            channel, channel_since, until, all_available=args.all_available)
+                            channel, channel_since, until, all_available=all_available)
                         print("Canal {} : {} ligne(s) nouvelles/corrigées, {} appels GetData, {} bloc(s) suspects".format(
                             channel, changed, windows, suspect))
                     except (ShellyConnectionError, ValueError, OSError) as exc:
-                        print("ERREUR {} canal {} : {}".format(device["alias"], channel, exc), file=sys.stderr)
-                        failures += 1
+                        print("ERREUR {} canal {} : {}".format(alias, channel, exc), file=sys.stderr)
+                        device_failed = True
         except (ShellyConnectionError, ValueError, OSError) as exc:
-            print("ERREUR {} : {}".format(device["alias"], exc), file=sys.stderr)
+            print("ERREUR {} : {}".format(alias, exc), file=sys.stderr)
+            device_failed = True
+        if daily_day:
+            mark_daily_device(db, daily_day, alias, not device_failed, current_utc())
+        if device_failed:
             failures += 1
     return 1 if failures else 0
+
+
+def export_after_collection(db, directory):
+    """Mettre à jour les CSV même si une partie de la collecte a échoué."""
+    try:
+        result = export_all(db, directory)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print("ERREUR export CSV : {}".format(exc), file=sys.stderr)
+        return False
+    print("CSV actualisés : {}".format(", ".join(
+        "{}={} ligne(s)".format(name, count) for name, count in result.items())))
+    return True
+
+
+def run_daily(db, devices, args):
+    """Une collecte réussie par jour, avec reprise des échecs/crash.
+
+    Le verrou fichier empêche deux instances daily concurrentes sur le Mac.
+    """
+    lockfile = Path(args.db).with_suffix(".daily.lock")
+    lockfile.parent.mkdir(parents=True, exist_ok=True)
+    with lockfile.open("a+") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("Une autre collecte quotidienne est déjà en cours.")
+            return 0
+        local_day = datetime.now().astimezone().date().isoformat()
+        earlier = daily_outcome(db, local_day)
+        if earlier == "success":
+            print("Collecte quotidienne {} déjà réussie ; pas de nouvelle lecture.".format(local_day))
+            return 0
+        # Ne pas consommer la tentative si aucun Shelly n'est accessible.
+        import socket
+        reachable = False
+        for device in devices:
+            try:
+                with socket.create_connection((device["host"], 80), timeout=2):
+                    reachable = True
+                    break
+            except OSError:
+                pass
+        if not reachable:
+            print("Réseau Shelly inaccessible : collecte non déclenchée.")
+            return 1
+        if not claim_daily(db, local_day, current_utc()):
+            print("Collecte {} déjà terminée.".format(local_day))
+            return 0
+        outcome = False
+        try:
+            code = run_collection(db, devices, args, daily_day=local_day)
+            exported = export_after_collection(db, args.exports)
+            outcome = code == 0 and exported
+            return 0 if outcome else 1
+        finally:
+            finish_daily(db, local_day, current_utc(), outcome)
 
 
 def coverage(db):
@@ -202,37 +266,10 @@ def main(argv=None):
         db = connect(args.db)
         try:
             if args.command == "daily":
-                local_day = datetime.now().astimezone().date().isoformat()
-                earlier = daily_outcome(db, local_day)
-                if earlier is not None:
-                    print("Collecte quotidienne {} déjà déclenchée ({}) ; pas de nouvelle lecture.".format(
-                        local_day, earlier))
-                    return 0
-                # Évite de consommer la seule tentative du jour si le Mac n'est
-                # pas sur le réseau RED : aucune lecture de donnée n'a lieu.
-                import socket
-                hosts = [device["host"] for device in devices]
-                reachable = False
-                for host in hosts:
-                    try:
-                        with socket.create_connection((host, 80), timeout=2):
-                            reachable = True
-                            break
-                    except OSError:
-                        pass
-                if not reachable:
-                    print("Réseau Shelly inaccessible : collecte non déclenchée.")
-                    return 0
-                if not claim_daily(db, local_day, current_utc()):
-                    print("Collecte déjà en cours pour {}".format(local_day))
-                    return 0
-                outcome = False
-                try:
-                    outcome = run_collection(db, devices, args) == 0
-                    return 0 if outcome else 1
-                finally:
-                    finish_daily(db, local_day, current_utc(), outcome)
-            return run_collection(db, devices, args)
+                return run_daily(db, devices, args)
+            code = run_collection(db, devices, args)
+            exported = export_after_collection(db, args.exports)
+            return code if exported else 1
         finally:
             db.close()
     except (OSError, ValueError, json.JSONDecodeError) as exc:

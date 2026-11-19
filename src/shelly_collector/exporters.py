@@ -1,6 +1,8 @@
 """Exports CSV Excel depuis SQLite, sans charger les mesures en mémoire."""
 import csv
 import json
+import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,16 +27,23 @@ def csv_value(value):
 
 
 def csv_stream(path, columns, rows):
+    """Écrire un CSV temporaire, puis le remplacer atomiquement si complet."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=columns, delimiter=";", extrasaction="ignore")
-        writer.writeheader()
-        count = 0
-        for row in rows:
-            writer.writerow({key: csv_value(value) for key, value in row.items()})
-            count += 1
+    fd, temporary = tempfile.mkstemp(prefix=".{}-".format(path.name), suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=columns, delimiter=";", extrasaction="ignore")
+            writer.writeheader()
+            count = 0
+            for row in rows:
+                writer.writerow({key: csv_value(value) for key, value in row.items()})
+                count += 1
+        os.replace(temporary, str(path))
         return count
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def export_all(db, directory):

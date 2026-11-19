@@ -34,6 +34,13 @@ CREATE TABLE IF NOT EXISTS daily_runs (
     finished_at_utc TEXT,
     outcome TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS daily_device_runs (
+    local_day TEXT NOT NULL,
+    device_alias TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    updated_at_utc TEXT NOT NULL,
+    PRIMARY KEY (local_day, device_alias)
+);
 CREATE TABLE IF NOT EXISTS suspect_blocks (
     device_id TEXT NOT NULL,
     channel INTEGER NOT NULL,
@@ -113,12 +120,35 @@ def last_channel_timestamp(db, device_id, channel):
 
 
 def claim_daily(db, day, started_at):
-    """Un seul déclenchement planifié par jour (même si le processus s'arrête)."""
+    """Un succès quotidien est définitif ; un échec/crash peut être repris.
+
+    Le verrou inter-processus est pris par la CLI avant cet appel.
+    """
     with db:
-        row = db.execute("""INSERT OR IGNORE INTO daily_runs
-              (local_day, started_at_utc, outcome)
-              VALUES (?, ?, 'running')""", (day, started_at))
+        row = db.execute("""INSERT INTO daily_runs
+              (local_day, started_at_utc, finished_at_utc, outcome)
+              VALUES (?, ?, NULL, 'running')
+              ON CONFLICT(local_day) DO UPDATE SET
+                started_at_utc=excluded.started_at_utc,
+                finished_at_utc=NULL, outcome='running'
+              WHERE daily_runs.outcome <> 'success'""", (day, started_at))
         return row.rowcount == 1
+
+
+def daily_device_outcome(db, day, alias):
+    row = db.execute("""SELECT outcome FROM daily_device_runs
+                        WHERE local_day=? AND device_alias=?""", (day, alias)).fetchone()
+    return row[0] if row else None
+
+
+def mark_daily_device(db, day, alias, success, when):
+    with db:
+        db.execute("""INSERT INTO daily_device_runs
+            (local_day, device_alias, outcome, updated_at_utc)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(local_day, device_alias) DO UPDATE SET
+              outcome=excluded.outcome, updated_at_utc=excluded.updated_at_utc""",
+            (day, alias, 'success' if success else 'failed', when))
 
 
 def finish_daily(db, day, finished_at, ok):

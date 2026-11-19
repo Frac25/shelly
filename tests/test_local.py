@@ -18,8 +18,12 @@ class TestLocal(unittest.TestCase):
             save_samples(db, device, 0, [(1795000000, 60, {"w": 42})])
             self.assertEqual(last_channel_timestamp(db, device, 0), 1795000000)
             self.assertTrue(claim_daily(db, "2026-11-19", "now"))
-            self.assertFalse(claim_daily(db, "2026-11-19", "now"))
+            # Une tentative interrompue/échouée peut être réclamée de nouveau
+            # par la CLI qui détient le verrou quotidien.
+            finish_daily(db, "2026-11-19", "later", False)
+            self.assertTrue(claim_daily(db, "2026-11-19", "later"))
             finish_daily(db, "2026-11-19", "later", True)
+            self.assertFalse(claim_daily(db, "2026-11-19", "later"))
             self.assertEqual(daily_outcome(db, "2026-11-19"), "success")
             db.close()
 
